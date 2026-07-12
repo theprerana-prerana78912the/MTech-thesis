@@ -1,0 +1,486 @@
+import cv2
+import torch
+import numpy as np
+import time
+from scipy.spatial.distance import cdist, pdist, squareform
+
+# =========================
+# SETTINGS
+# =========================
+
+PROXIMITY_THRESHOLD = 180
+MIN_GROUP_SIZE = 2
+MAX_TRACK_LOST = 15
+
+# =========================
+# PERSON TRACKER
+# =========================
+
+class PersonTracker:
+    def __init__(self):
+        self.next_id = 0
+        self.people = {}
+
+    def update(self, detections):
+
+        current_time = time.time()
+
+        if len(detections) == 0:
+            remove_ids = []
+
+            for pid in self.people:
+                self.people[pid]["lost"] += 1
+
+                if self.people[pid]["lost"] > MAX_TRACK_LOST:
+                    remove_ids.append(pid)
+
+            for pid in remove_ids:
+                del self.people[pid]
+
+            return list(self.people.values())
+
+        detection_centers = np.array([d["center"] for d in detections])
+
+        # First frame
+        if len(self.people) == 0:
+            for det in detections:
+
+                self.people[self.next_id] = {
+                    "id": self.next_id,
+                    "bbox": det["bbox"],
+                    "center": det["center"],
+                    "speed": 0,
+                    "history": [(det["center"], current_time)],
+                    "lost": 0
+                }
+
+                self.next_id += 1
+
+            return list(self.people.values())
+
+        tracked_ids = list(self.people.keys())
+        tracked_centers = np.array(
+            [self.people[i]["center"] for i in tracked_ids]
+        )
+
+        D = cdist(tracked_centers, detection_centers)
+
+        used_tracks = set()
+        used_dets = set()
+
+        while True:
+
+            if D.size == 0:
+                break
+
+            min_index = np.unravel_index(np.argmin(D), D.shape)
+
+            track_idx = min_index[0]
+            det_idx = min_index[1]
+
+            if D[track_idx, det_idx] > 120:
+                break
+
+            if track_idx in used_tracks or det_idx in used_dets:
+                D[track_idx, det_idx] = 999999
+                continue
+
+            pid = tracked_ids[track_idx]
+
+            old_center = np.array(self.people[pid]["center"])
+            new_center = np.array(detections[det_idx]["center"])
+
+            dt = current_time - self.people[pid]["history"][-1][1]
+
+            speed = 0
+
+            if dt > 0:
+                speed = np.linalg.norm(new_center - old_center) / dt
+
+            self.people[pid]["bbox"] = detections[det_idx]["bbox"]
+            self.people[pid]["center"] = detections[det_idx]["center"]
+            self.people[pid]["speed"] = speed
+            self.people[pid]["lost"] = 0
+
+            self.people[pid]["history"].append(
+                (detections[det_idx]["center"], current_time)
+            )
+
+            if len(self.people[pid]["history"]) > 10:
+                self.people[pid]["history"].pop(0)
+
+            used_tracks.add(track_idx)
+            used_dets.add(det_idx)
+
+            D[track_idx, :] = 999999
+            D[:, det_idx] = 999999
+
+        # Lost tracks
+        for i, pid in enumerate(tracked_ids):
+
+            if i not in used_tracks:
+
+                self.people[pid]["lost"] += 1
+
+        # Remove vanished people
+        remove_ids = []
+
+        for pid in self.people:
+
+            if self.people[pid]["lost"] > MAX_TRACK_LOST:
+                remove_ids.append(pid)
+
+        for pid in remove_ids:
+            del self.people[pid]
+
+        # Add new detections
+        for i, det in enumerate(detections):
+
+            if i not in used_dets:
+
+                self.people[self.next_id] = {
+                    "id": self.next_id,
+                    "bbox": det["bbox"],
+                    "center": det["center"],
+                    "speed": 0,
+                    "history": [(det["center"], current_time)],
+                    "lost": 0
+                }
+
+                self.next_id += 1
+
+        return list(self.people.values())
+
+# =========================
+# GROUP DETECTION
+# =========================
+
+def detect_groups(people):
+
+    if len(people) < 2:
+        return []
+
+    centers = np.array([p["center"] for p in people])
+
+    dist_matrix = squareform(pdist(centers))
+
+    visited = [False] * len(people)
+
+    groups = []
+
+    for i in range(len(people)):
+
+        if visited[i]:
+            continue
+
+        queue = [i]
+        visited[i] = True
+
+        group_indices = []
+
+        while len(queue) > 0:
+
+            current = queue.pop(0)
+
+            group_indices.append(current)
+
+            for j in range(len(people)):
+
+                if not visited[j]:
+
+                    distance = dist_matrix[current, j]
+
+                    # Better nearby group separation
+                    if distance < PROXIMITY_THRESHOLD:
+                        visited[j] = True
+                        queue.append(j)
+
+        group = [people[idx] for idx in group_indices]
+
+        if len(group) >= MIN_GROUP_SIZE:
+            groups.append(group)
+
+    return groups
+
+# =========================
+# SCORES
+# =========================
+
+def proximity_score(group):
+
+    if len(group) < 2:
+        return 0
+
+    centers = np.array([p["center"] for p in group])
+
+    dist = pdist(centers)
+
+    avg = np.mean(dist)
+
+    score = max(0, 1 - avg / PROXIMITY_THRESHOLD)
+
+    return round(score, 2)
+
+def speed_score(group):
+
+    if len(group) < 2:
+        return 1
+
+    speeds = [p["speed"] for p in group]
+
+    std = np.std(speeds)
+
+    score = 1 / (1 + 0.03 * std)
+
+    return round(score, 2)
+
+def size_score(group):
+
+    size = len(group)
+
+    if size == 2:
+        return 0.7
+
+    if size == 3:
+        return 1.0
+
+    if size == 4:
+        return 0.9
+
+    if size == 5:
+        return 0.8
+
+    if size >= 6:
+        return 0.7
+
+    return 0
+
+def interaction_score(group):
+
+    if len(group) < 2:
+        return 0
+
+    centers = np.array([p["center"] for p in group])
+
+    dist = pdist(centers)
+
+    avg = np.mean(dist)
+
+    score = max(0, 1 - avg / 300)
+
+    return round(score, 2)
+
+def overall_score(group):
+
+    p = proximity_score(group)
+    s = speed_score(group)
+    sz = size_score(group)
+    inter = interaction_score(group)
+
+    total = (
+        p * 0.35 +
+        s * 0.25 +
+        sz * 0.20 +
+        inter * 0.20
+    )
+
+    return round(total, 2)
+
+# =========================
+# DRAWING
+# =========================
+
+def draw_groups(frame, groups):
+
+    colors = [
+        (0,255,0),
+        (255,0,0),
+        (0,0,255),
+        (255,255,0),
+        (255,0,255),
+        (0,255,255)
+    ]
+
+    for idx, group in enumerate(groups):
+
+        color = colors[idx % len(colors)]
+
+        xs = []
+        ys = []
+
+        for person in group:
+
+            x1,y1,x2,y2 = person["bbox"]
+
+            xs.extend([x1,x2])
+            ys.extend([y1,y2])
+
+            cv2.rectangle(
+                frame,
+                (x1,y1),
+                (x2,y2),
+                color,
+                2
+            )
+
+            cv2.putText(
+                frame,
+                f"ID {person['id']}",
+                (x1,y1-5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                1
+            )
+
+        gx1 = min(xs)
+        gy1 = min(ys)
+        gx2 = max(xs)
+        gy2 = max(ys)
+
+        cv2.rectangle(
+            frame,
+            (gx1,gy1),
+            (gx2,gy2),
+            color,
+            3
+        )
+
+        prox = proximity_score(group)
+        speed = speed_score(group)
+        size = size_score(group)
+        inter = interaction_score(group)
+        overall = overall_score(group)
+
+        text = [
+            f"GROUP {idx+1}",
+            f"People: {len(group)}",
+            f"Proximity: {prox}",
+            f"Speed: {speed}",
+            f"Size: {size}",
+            f"Interaction: {inter}",
+            f"Overall: {overall}"
+        ]
+
+        y = gy1 - 120
+
+        if y < 20:
+            y = 20
+
+        for t in text:
+
+            cv2.putText(
+                frame,
+                t,
+                (gx1, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                color,
+                2
+            )
+
+            y += 22
+
+# =========================
+# YOLO
+# =========================
+
+print("Loading YOLOv5...")
+
+model = torch.hub.load(
+    'ultralytics/yolov5',
+    'yolov5s',
+    pretrained=True
+)
+
+model.conf = 0.45
+model.classes = [0]
+
+print("YOLO Loaded")
+
+# =========================
+# CAMERA
+# =========================
+
+cap = cv2.VideoCapture(0)
+
+tracker = PersonTracker()
+
+while True:
+
+    ret, frame = cap.read()
+
+    if not ret:
+        break
+
+    frame = cv2.flip(frame, 1)
+
+    results = model(frame)
+
+    detections = []
+
+    for det in results.xyxy[0]:
+
+        x1,y1,x2,y2,conf,cls = det.tolist()
+
+        x1 = int(x1)
+        y1 = int(y1)
+        x2 = int(x2)
+        y2 = int(y2)
+
+        w = x2 - x1
+        h = y2 - y1
+
+        # Better false detection filtering
+        if w < 40 or h < 80:
+            continue
+
+        cx = int((x1+x2)/2)
+        cy = int((y1+y2)/2)
+
+        detections.append({
+            "bbox": (x1,y1,x2,y2),
+            "center": (cx,cy)
+        })
+
+    tracked_people = tracker.update(detections)
+
+    # ONLY current visible people
+    visible_people = [
+        p for p in tracked_people
+        if p["lost"] == 0
+    ]
+
+    groups = detect_groups(visible_people)
+
+    draw_groups(frame, groups)
+
+    cv2.putText(
+        frame,
+        f"Visible People: {len(visible_people)}",
+        (20,40),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (0,255,0),
+        2
+    )
+
+    cv2.putText(
+        frame,
+        f"Groups: {len(groups)}",
+        (20,80),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (0,0,255),
+        2
+    )
+
+    cv2.imshow("Advanced Group Detection", frame)
+
+    key = cv2.waitKey(1)
+
+    if key == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
