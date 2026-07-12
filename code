@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import LaserScan
+from std_msgs.msg import Float32MultiArray
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+
+import numpy as np
+import math
+import random
+from collections import deque
+
+class APFController(Node):
+
+    def __init__(self):
+        super().__init__('apf_controller')
+
+        # =========================
+        # QoS SETTINGS
+        # =========================
+        default_qos = QoSProfile(
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE
+        )
+
+        scan_qos = QoSProfile(
+            depth=10,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE
+        )
+
+        # =========================
+        # TOPICS
+        # =========================
+        self.cmd_pub = self.create_publisher(
+            Twist,
+            '/cmd_vel',
+            default_qos
+        )
+
+        self.create_subscription(Odometry, '/odom', self.odom_callback, default_qos)
+        self.create_subscription(LaserScan, '/scan', self.scan_callback, scan_qos)
+        
+        # NEW: Subscribe to Laptop's Vision Node
+        self.create_subscription(Float32MultiArray, '/group_cohesion', self.cohesion_callback, default_qos)
+
+        # =========================
+        # CONTROL LOOP
+        # =========================
+        self.timer = self.create_timer(0.15, self.control_loop)
+
+        # =========================
+        # GOAL
+        # =========================
+        self.goal = np.array([0.4, 0.4])
+
+        # =========================
+        # ROBOT STATE
+        # =========================
+        self.position = np.zeros(2)
+        self.yaw = 0.0
+
+        self.scan = []
+        self.scan_ready = False
+
+        self.angle_min = 0.0
+        self.angle_increment = 0.0
+
+        self.start_position = None
+        self.start_yaw = None
+        self.frame_initialized = False
+
+        # =========================
+        # DYNAMIC APF PARAMETERS
+        # =========================
+        self.k_attr = 1.2
+        
+        # Base parameters (used for static obstacles like walls)
+        self.base_k_rep = 0.35
+        self.base_rep_radius = 0.32
+        
+        # Current parameters (can grow based on human groups)
+        self.current_k_rep = self.base_k_rep
+        self.current_rep_radius = self.base_rep_radius
+        self.group_factor = 0.0
+
+        # =========================
+        # SPEED & SAFETY PARAMETERS
+        # =========================
+        self.min_speed = 0.03
+        self.max_speed = 0.10
+        self.max_angular = 0.5
+        self.emergency_stop_distance = 0.18
+        self.goal_threshold = 0.05
+
+        self.last_linear = 0.0
+        self.last_angular = 0.0
+        self.linear_alpha = 0.7
+        self.angular_alpha = 0.5
+
+        self.position_history = deque(maxlen=15)
+        self.stuck_counter = 0
+        self.control_count = 0
+
+        self.get_logger().info("===================================")
+        self.get_logger().info(" DYNAMIC APF + GROUP AVOIDANCE ")
+        self.get_logger().info("===================================")
+        self.get_logger().info(f"Goal: {self.goal}")
+
+    # ==================================================
+    # COHESION CALLBACK (FROM LAPTOP)
+    # ==================================================
+    def cohesion_callback(self, msg):
+        if len(msg.data) >= 2:
+            prox_score = msg.data[0]
+            vel_score = msg.data[1]
+            
+            # Combine scores. If people are close OR moving together, increase factor.
+            self.group_factor = max(prox_score, vel_score)
+            
+            # Dynamic Scaling:
+            # If factor is 0, we use base parameters.
+            # If factor is 1 (tight group), we increase force by 150% and radius by 80%.
+            self.current_k_rep = self.base_k_rep * (1.0 + (1.5 * self.group_factor))
+            self.current_rep_radius = self.base_rep_radius * (1.0 + (0.8 * self.group_factor))
+
+    # ==================================================
+    # ODOM & SCAN CALLBACKS
+    # ==================================================
+    def odom_callback(self, msg):
+        x = msg.pose.pose.position.x
+        y = msg.pose.pose.position.y
+        q = msg.pose.pose.orientation
+
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        yaw = math.atan2(siny_cosp, cosy_cosp)
+
+        if not self.frame_initialized:
+            self.start_position = np.array([x, y])
+            self.start_yaw = yaw
+            self.frame_initialized = True
+
+        dx = x - self.start_position[0]
+        dy = y - self.start_position[1]
+
+        cos_yaw = math.cos(-self.start_yaw)
+        sin_yaw = math.sin(-self.start_yaw)
+
+        self.position[0] = dx * cos_yaw - dy * sin_yaw
+        self.position[1] = dx * sin_yaw + dy * cos_yaw
+        self.yaw = yaw - self.start_yaw
+        self.position_history.append(self.position.copy())
+
+    def scan_callback(self, msg):
+        self.scan = msg.ranges
+        self.angle_min = msg.angle_min
+        self.angle_increment = msg.angle_increment
+        self.scan_ready = True
+
+    def is_stuck(self):
+        if len(self.position_history) < 10: return False
+        movement = np.linalg.norm(self.position_history[-1] - self.position_history[0])
+        self.stuck_counter = self.stuck_counter + 1 if movement < 0.015 else 0
+        return self.stuck_counter > 12
+
+    # ==================================================
+    # REPULSIVE FORCE (NOW DYNAMIC)
+    # ==================================================
+    def compute_repulsive_force(self):
+        rep_force = np.zeros(2)
+
+        for i, r in enumerate(self.scan):
+            if math.isinf(r) or math.isnan(r) or r < 0.05 or r > self.current_rep_radius:
+                continue
+
+            angle = self.angle_min + i * self.angle_increment
+            global_angle = angle + self.yaw
+
+            obs_dir = np.array([math.cos(global_angle), math.sin(global_angle)])
+
+            # Using dynamic radius and force constant
+            magnitude = self.current_k_rep * ((1.0 / r) - (1.0 / self.current_rep_radius)) / (r * r)
+            rep_force -= magnitude * obs_dir
+
+        return rep_force
+
+    # ==================================================
+    # MAIN CONTROL LOOP
+    # ==================================================
+    def control_loop(self):
+        if not self.scan_ready or not self.frame_initialized: return
+
+        cmd = Twist()
+        to_goal = self.goal - self.position
+        dist_to_goal = np.linalg.norm(to_goal)
+
+        if dist_to_goal < self.goal_threshold:
+            self.cmd_pub.publish(cmd)
+            self.get_logger().info("GOAL REACHED")
+            return
+
+        valid_ranges = [r for r in self.scan if not math.isinf(r) and not math.isnan(r)]
+        if valid_ranges and min(valid_ranges) < self.emergency_stop_distance:
+            self.cmd_pub.publish(cmd)
+            self.get_logger().warn("EMERGENCY STOP - OBSTACLE TOO CLOSE")
+            return
+
+        if self.is_stuck():
+            cmd.angular.z = random.choice([-0.5, 0.5])
+            self.cmd_pub.publish(cmd)
+            self.stuck_counter = 0
+            return
+
+        attr_force = self.k_attr * (to_goal / dist_to_goal)
+        rep_force = self.compute_repulsive_force()
+        total_force = attr_force + rep_force
+
+        target_angle = math.atan2(total_force[1], total_force[0])
+        angle_diff = math.atan2(math.sin(target_angle - self.yaw), math.cos(target_angle - self.yaw))
+
+        speed = 0.04 if dist_to_goal < 0.15 else self.max_speed
+        if abs(angle_diff) > 1.0: linear_speed = 0.0
+        elif abs(angle_diff) > 0.6: linear_speed = speed * 0.3
+        else: linear_speed = speed
+
+        angular_speed = max(-self.max_angular, min(self.max_angular, 1.2 * math.tanh(angle_diff)))
+
+        linear_speed = self.linear_alpha * self.last_linear + (1 - self.linear_alpha) * linear_speed
+        angular_speed = self.angular_alpha * self.last_angular + (1 - self.angular_alpha) * angular_speed
+
+        self.last_linear = linear_speed
+        self.last_angular = angular_speed
+
+        cmd.linear.x = linear_speed
+        cmd.angular.z = angular_speed
+        self.cmd_pub.publish(cmd)
+
+        self.control_count += 1
+        if self.control_count % 10 == 0:
+            self.get_logger().info(
+                f"GOAL_DIST={dist_to_goal:.2f} | "
+                f"GRP_FACT={self.group_factor:.2f} -> RAD={self.current_rep_radius:.2f}m"
+            )
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = APFController()
+    try: rclpy.spin(node)
+    except KeyboardInterrupt: pass
+    finally:
+        node.cmd_pub.publish(Twist())
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
